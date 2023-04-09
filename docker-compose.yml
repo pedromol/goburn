@@ -1,0 +1,9 @@
+version: "3.4"
+
+services:
+  goburn:
+    container_name: goburn
+    image: pedromol/goburn
+    cpus: 0.15
+    network_mode: none
+    restart: unless-stopped
