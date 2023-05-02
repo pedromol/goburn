@@ -4,6 +4,10 @@ import (
     "math/rand"
 	"crypto/aes"
 	"encoding/hex"
+	"runtime"
+	"os"
+    "strconv"
+	"fmt"
 )
 
 var l = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
@@ -35,6 +39,24 @@ func decrypt(k string, m string) string {
 }
 
 func main() {
+	var data = make([]byte, 1)
+    memPercentageStr := os.Getenv("MEMORY_PERCENTAGE")
+    if memPercentageStr != "" {
+		memPercentage, err := strconv.ParseFloat(memPercentageStr, 64)
+		if err != nil {
+			fmt.Println("Invalid memory percentage:", memPercentageStr)
+			os.Exit(1)
+		}
+	
+		mem := runtime.MemStats{}
+		runtime.ReadMemStats(&mem)
+		totalMem := mem.Sys
+	
+		memToAllocate := uint64(float64(totalMem) * memPercentage / 100)
+	
+		data = make([]byte, memToAllocate)
+		data[0] = 1
+	}
 	for {
 		key := rnd(32)
 		decrypt(key, encrypt(key, key))
