@@ -47,6 +47,7 @@ func main() {
 			fmt.Println("Invalid memory percentage:", memPercentageStr)
 			os.Exit(1)
 		}
+		fmt.Println("Burning % memory:", memPercentageStr)
 	
 		mem := runtime.MemStats{}
 		runtime.ReadMemStats(&mem)
