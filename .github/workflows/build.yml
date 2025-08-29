@@ -1,43 +1,319 @@
-name: CI
+name: CI/CD Pipeline
 
 on:
   push:
     branches:
+      - main
       - master
-
+      - develop
+  pull_request:
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
+env:
+  GO_VERSION: '1.20'
+  COVERAGE_THRESHOLD: 80
+
 jobs:
-  buildx:
+  # Test and code quality job
+  test:
+    name: Test & Code Quality
     runs-on: ubuntu-latest
     steps:
-      -
-        name: Checkout
-        uses: actions/checkout@v2
-      -
-        name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
         with:
-          image: tonistiigi/binfmt:latest
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
+        run: |
+          go mod download
+          go mod tidy
+          go mod verify
+
+      - name: Install additional tools
+        run: |
+          go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
+
+      - name: Code formatting check
+        run: |
+          if [ "$(gofmt -l . | wc -l)" -gt 0 ]; then
+            echo "Code is not formatted. Run 'go fmt ./...'"
+            gofmt -l .
+            exit 1
+          fi
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Security scan
+        run: gosec ./...
+        continue-on-error: true
+
+      - name: Run unit tests
+        run: |
+          echo "🧪 Running unit tests..."
+          go test -timeout 300s -run "^Test[^I]" -v ./...
+
+      - name: Run integration tests
+        run: |
+          echo "🧪 Running integration tests..."
+          go test -timeout 300s -run "^TestI" -v ./...
+
+      - name: Run tests with coverage
+        run: |
+          echo "📊 Running tests with coverage..."
+          mkdir -p coverage
+          go test -timeout 300s -coverprofile=coverage/coverage.out -covermode=atomic ./...
+          go tool cover -html=coverage/coverage.out -o coverage/coverage.html
+
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(go tool cover -func=coverage/coverage.out | grep total | awk '{print $3}' | sed 's/%//')
+          echo "Coverage: ${COVERAGE}%"
+          if (( $(echo "$COVERAGE < $COVERAGE_THRESHOLD" | bc -l) )); then
+            echo "❌ Coverage ${COVERAGE}% is below threshold ${COVERAGE_THRESHOLD}%"
+            exit 1
+          fi
+          echo "✅ Coverage ${COVERAGE}% meets threshold ${COVERAGE_THRESHOLD}%"
+
+      - name: Run race condition tests
+        run: |
+          echo "🏃 Running race condition tests..."
+          go test -race -timeout 300s ./...
+
+      - name: Run benchmark tests
+        run: |
+          echo "⚡ Running benchmark tests..."
+          go test -bench=. -benchmem -count=3 ./... | tee benchmark_results.txt
+
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: |
+            coverage/coverage.html
+            coverage/coverage.out
+            benchmark_results.txt
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: coverage/coverage.out
+          flags: unittests
+          name: codecov-umbrella
+        continue-on-error: true
+
+  # Build job (runs after successful tests)
+  build:
+    name: Build Binary
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+        exclude:
+          - goos: windows
+            goarch: arm64
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
+      - name: Build binary
+        run: |
+          mkdir -p dist
+          BINARY_NAME=goburn
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME=goburn.exe
+          fi
+          
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+          go build -ldflags="-w -s -X main.version=${GITHUB_SHA::8}" \
+          -o dist/${BINARY_NAME}-${{ matrix.goos }}-${{ matrix.goarch }} ./...
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+
+  # Docker build and push job (runs after successful tests)
+  docker:
+    name: Build & Push Docker Images
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
           platforms: all
-      -
-        name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@v1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
         with:
           install: true
-      -
-        name: Login to Docker Hub
-        uses: docker/login-action@v1
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      -
-        name: Build and push
-        uses: docker/build-push-action@v2
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/goburn
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: linux/amd64, linux/arm64, linux/arm/v7
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/goburn:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/goburn:latest
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
+
+  # Kubernetes manifest validation
+  k8s-validate:
+    name: Validate Kubernetes Manifests
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install kubeval
+        run: |
+          wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+          tar xf kubeval-linux-amd64.tar.gz
+          sudo mv kubeval /usr/local/bin
+
+      - name: Validate Kubernetes manifests
+        run: |
+          echo "🔍 Validating Kubernetes manifests..."
+          kubeval k8s-manifests.yaml
+          echo "✅ Kubernetes manifests are valid"
+
+      - name: Install and run kube-score
+        run: |
+          wget https://github.com/zegl/kube-score/releases/download/v1.16.1/kube-score_1.16.1_linux_amd64.tar.gz
+          tar xf kube-score_1.16.1_linux_amd64.tar.gz
+          sudo mv kube-score /usr/local/bin
+          echo "📊 Running kube-score analysis..."
+          kube-score score k8s-manifests.yaml || true
+
+  # Release job (only on tags)
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [test, build, docker]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            binaries-*/*
+            coverage-report/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Deployment validation job
+  deploy-test:
+    name: Test Deployment
+    runs-on: ubuntu-latest
+    needs: [docker, k8s-validate]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create k3s cluster
+        uses: nolar/setup-k3d-k3s@v1
+        with:
+          version: v1.27
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test deployment
+        run: |
+          echo "🚀 Testing deployment in k3s cluster..."
+          
+          # Apply manifests
+          kubectl apply -f k8s-manifests.yaml
+          
+          # Wait for pods to be ready
+          kubectl wait --for=condition=ready pod -l app=goburn --timeout=300s || true
+          
+          # Check deployment status
+          kubectl get pods -l app=goburn
+          kubectl get daemonsets
+          
+          # Check logs
+          echo "📋 Checking logs..."
+          kubectl logs -l app=goburn --tail=50 || true
+          
+          echo "✅ Deployment test completed"

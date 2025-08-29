@@ -1,0 +1,70 @@
+name: Update Badges
+
+on:
+  workflow_run:
+    workflows: ["CI/CD Pipeline"]
+    types:
+      - completed
+  schedule:
+    # Update badges daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-badges:
+    name: Update README Badges
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get latest workflow run
+        id: workflow
+        run: |
+          # Get the latest workflow run status
+          WORKFLOW_STATUS=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build.yml/runs?per_page=1" | \
+            jq -r '.workflow_runs[0].conclusion')
+          
+          echo "status=${WORKFLOW_STATUS}" >> $GITHUB_OUTPUT
+
+      - name: Update README with badges
+        run: |
+          # Create or update badge section in README
+          cat > badge_section.md << 'EOF'
+          
+          ## Status
+          
+          [![CI/CD Pipeline](https://github.com/${{ github.repository }}/actions/workflows/build.yml/badge.svg)](https://github.com/${{ github.repository }}/actions/workflows/build.yml)
+          [![codecov](https://codecov.io/gh/${{ github.repository }}/branch/main/graph/badge.svg)](https://codecov.io/gh/${{ github.repository }})
+          [![Go Report Card](https://goreportcard.com/badge/github.com/${{ github.repository }})](https://goreportcard.com/report/github.com/${{ github.repository }})
+          [![Docker Pulls](https://img.shields.io/docker/pulls/pedromol/goburn)](https://hub.docker.com/r/pedromol/goburn)
+          [![License](https://img.shields.io/github/license/${{ github.repository }})](LICENSE)
+          [![Release](https://img.shields.io/github/v/release/${{ github.repository }})](https://github.com/${{ github.repository }}/releases)
+          
+          EOF
+          
+          # Check if badges already exist in README
+          if grep -q "## Status" README.md; then
+            # Replace existing badge section
+            sed -i '/## Status/,/^$/c\' README.md
+            sed -i '/## Status/r badge_section.md' README.md
+          else
+            # Add badges after the title
+            sed -i '1a\\' README.md
+            sed -i '2r badge_section.md' README.md
+          fi
+          
+          rm badge_section.md
+
+      - name: Commit and push if changed
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add README.md
+          git diff --staged --quiet || git commit -m "docs: update status badges [skip ci]"
+          git push

@@ -3,7 +3,21 @@ version: "3.4"
 services:
   goburn:
     container_name: goburn
-    image: pedromol/goburn
-    cpus: 0.15
-    network_mode: none
+    image: pedromol/goburn:latest
+    environment:
+      - TARGET_CPU_UTILIZATION=80
+      - TARGET_MEMORY_UTILIZATION=80
+      - MIN_CPU_UTILIZATION=20
+      - MIN_MEMORY_UTILIZATION=20
+      - MIN_NETWORK_UTILIZATION_MBPS=20
+      - MONITOR_INTERVAL_SECONDS=30
+      - SCALE_UP_DELAY_SECONDS=60
+      - SCALE_DOWN_DELAY_SECONDS=120
+      - MAX_MEMORY_MB=1024
+      - NODE_NAME=docker-host
+      - ENABLE_MEMORY_UTILIZATION=true
+      - NETWORK_INTERFACE=eth0
+    cpus: 2.0
+    memory: 2g
     restart: unless-stopped
+    # Note: For Kubernetes deployment, use k8s-manifests.yaml instead

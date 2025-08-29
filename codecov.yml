@@ -1,0 +1,36 @@
+# Codecov configuration for goburn
+# https://docs.codecov.com/docs/codecov-yaml
+
+coverage:
+  status:
+    project:
+      default:
+        target: 80%
+        threshold: 1%
+        base: auto
+    patch:
+      default:
+        target: 80%
+        threshold: 1%
+
+comment:
+  layout: "header, diff, flags, files, footer"
+  behavior: default
+  require_changes: false
+
+ignore:
+  - "examples/**/*"
+  - "coverage/**/*"
+  - "dist/**/*"
+  - "**/*_test.go"
+  - "**/test_*.go"
+  - "**/*.pb.go"
+
+flags:
+  unittests:
+    paths:
+      - "."
+    carryforward: true
+
+github_checks:
+  annotations: true
