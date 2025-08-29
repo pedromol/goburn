@@ -1,29 +1,33 @@
-FROM golang:1.20-alpine as build
+# Build stage
+FROM golang:1.20-alpine AS build
 
-WORKDIR /go/src/app
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates tzdata
 
 # Copy go mod files first for better caching
-COPY go.mod go.sum* ./
-RUN go mod download
+COPY go.mod go.sum ./
+RUN go mod download && go mod verify
 
-# Copy source code
-COPY main.go ./
+# Copy all source files
+COPY *.go ./
 
-# Build the application
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags '-extldflags "-static" -w -s' -tags timetzdata -o goburn
+# Build with optimizations
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
+    go build -a -installsuffix cgo \
+    -ldflags='-w -s -extldflags "-static"' \
+    -o goburn .
 
-FROM alpine:latest
+# Final stage - use distroless for minimal size and security
+FROM gcr.io/distroless/static-debian11:nonroot
 
-# Install ca-certificates for HTTPS requests to k8s API
-RUN apk --no-cache add ca-certificates tzdata
-
-WORKDIR /root/
+# Copy ca-certificates and timezone data
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
 
 # Copy the binary
-COPY --from=build /go/src/app/goburn .
+COPY --from=build /app/goburn /goburn
 
-# Use non-root user for security
-RUN adduser -D -s /bin/sh goburn
-USER goburn
-
-ENTRYPOINT ["./goburn"]
+# Use non-root user (already set in distroless:nonroot)
+ENTRYPOINT ["/goburn"]
