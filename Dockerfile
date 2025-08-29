@@ -13,21 +13,26 @@ RUN go mod download && go mod verify
 # Copy all source files
 COPY *.go ./
 
-# Build with optimizations
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH \
+# Build with optimizations - use native architecture detection
+RUN CGO_ENABLED=0 GOOS=linux \
     go build -a -installsuffix cgo \
     -ldflags='-w -s -extldflags "-static"' \
     -o goburn .
 
-# Final stage - use distroless for minimal size and security
-FROM gcr.io/distroless/static-debian11:nonroot
+# Final stage - use alpine for better compatibility
+FROM alpine:latest
 
-# Copy ca-certificates and timezone data
-COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
+# Install ca-certificates for HTTPS requests to k8s API
+RUN apk --no-cache add ca-certificates tzdata && \
+    adduser -D -s /bin/sh goburn
 
-# Copy the binary
-COPY --from=build /app/goburn /goburn
+WORKDIR /app
 
-# Use non-root user (already set in distroless:nonroot)
-ENTRYPOINT ["/goburn"]
+# Copy the binary with correct permissions
+COPY --from=build /app/goburn /app/goburn
+RUN chmod +x /app/goburn
+
+# Use non-root user
+USER goburn
+
+ENTRYPOINT ["/app/goburn"]
