@@ -39,7 +39,7 @@ func TestResourceBurner_GetNodeMetrics_NotFound(t *testing.T) {
 }
 
 func TestResourceBurner_ScalingBehavior(t *testing.T) {
-	rb := createTestResourceBurner(t)
+	rb := createTestResourceBurner()
 
 	// Test minimum enforcement scenarios
 	tests := []struct {
@@ -130,7 +130,7 @@ func TestResourceBurner_ScalingBehavior(t *testing.T) {
 }
 
 func TestResourceBurner_CPUSampleManagement(t *testing.T) {
-	rb := createTestResourceBurner(t)
+	rb := createTestResourceBurner()
 
 	// Test that samples are limited to 100
 	for i := 0; i < 150; i++ {
@@ -152,7 +152,7 @@ func TestResourceBurner_CPUSampleManagement(t *testing.T) {
 }
 
 func TestResourceBurner_MemoryAllocationLimits(t *testing.T) {
-	rb := createTestResourceBurner(t)
+	rb := createTestResourceBurner()
 
 	// Test that memory allocation respects MaxMemoryMB limit
 	rb.config.MaxMemoryMB = 10 // 10MB limit
@@ -168,7 +168,7 @@ func TestResourceBurner_MemoryAllocationLimits(t *testing.T) {
 }
 
 func TestResourceBurner_WorkerLimits(t *testing.T) {
-	rb := createTestResourceBurner(t)
+	rb := createTestResourceBurner()
 
 	// Test CPU worker limits (the actual limit is runtime.NumCPU() * 2)
 	maxCPUWorkers := 50 // Be more lenient with the limit
@@ -195,7 +195,7 @@ func TestResourceBurner_WorkerLimits(t *testing.T) {
 
 // Test context cancellation behavior
 func TestResourceBurner_ContextCancellation(t *testing.T) {
-	rb := createTestResourceBurner(t)
+	rb := createTestResourceBurner()
 
 	_, cancel := context.WithCancel(context.Background())
 
@@ -285,9 +285,7 @@ func TestConfigValidation(t *testing.T) {
 
 // Benchmark integration tests
 func BenchmarkResourceBurner_AdjustCPULoad(b *testing.B) {
-	// Create a dummy testing.T for the helper function
-	dummyT := &testing.T{}
-	rb := createTestResourceBurner(dummyT)
+	rb := createTestResourceBurner()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -296,9 +294,7 @@ func BenchmarkResourceBurner_AdjustCPULoad(b *testing.B) {
 }
 
 func BenchmarkResourceBurner_AdjustMemoryLoad(b *testing.B) {
-	// Create a dummy testing.T for the helper function
-	dummyT := &testing.T{}
-	rb := createTestResourceBurner(dummyT)
+	rb := createTestResourceBurner()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -307,9 +303,7 @@ func BenchmarkResourceBurner_AdjustMemoryLoad(b *testing.B) {
 }
 
 func BenchmarkResourceBurner_AdjustNetworkLoad(b *testing.B) {
-	// Create a dummy testing.T for the helper function
-	dummyT := &testing.T{}
-	rb := createTestResourceBurner(dummyT)
+	rb := createTestResourceBurner()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

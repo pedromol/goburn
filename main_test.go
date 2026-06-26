@@ -409,48 +409,6 @@ func TestEncryptDecrypt(t *testing.T) {
 	}
 }
 
-func TestMinMax(t *testing.T) {
-	tests := []struct {
-		name     string
-		a, b     int64
-		expected int64
-	}{
-		{"min: a < b", 5, 10, 5},
-		{"min: a > b", 15, 8, 8},
-		{"min: a == b", 7, 7, 7},
-		{"min: negative", -5, -2, -5},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name+" min", func(t *testing.T) {
-			result := min(tt.a, tt.b)
-			if result != tt.expected {
-				t.Errorf("min(%d, %d) = %d, want %d", tt.a, tt.b, result, tt.expected)
-			}
-		})
-	}
-
-	maxTests := []struct {
-		name     string
-		a, b     int64
-		expected int64
-	}{
-		{"max: a < b", 5, 10, 10},
-		{"max: a > b", 15, 8, 15},
-		{"max: a == b", 7, 7, 7},
-		{"max: negative", -5, -2, -2},
-	}
-
-	for _, tt := range maxTests {
-		t.Run(tt.name+" max", func(t *testing.T) {
-			result := max(tt.a, tt.b)
-			if result != tt.expected {
-				t.Errorf("max(%d, %d) = %d, want %d", tt.a, tt.b, result, tt.expected)
-			}
-		})
-	}
-}
-
 func TestMinInt(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -496,7 +454,7 @@ func TestAbs(t *testing.T) {
 	}
 }
 
-func createTestResourceBurner(t *testing.T) *ResourceBurner {
+func createTestResourceBurner() *ResourceBurner {
 	config := Config{
 		TargetCPUUtilization:      80.0,
 		TargetMemoryUtilization:   80.0,
@@ -529,7 +487,7 @@ func createTestResourceBurner(t *testing.T) *ResourceBurner {
 }
 
 func TestResourceBurner_AddCPUSample(t *testing.T) {
-	rb := createTestResourceBurner(t)
+	rb := createTestResourceBurner()
 
 	// Test adding samples
 	samples := []float64{10.0, 20.0, 30.0, 40.0, 50.0}
@@ -549,7 +507,7 @@ func TestResourceBurner_AddCPUSample(t *testing.T) {
 }
 
 func TestResourceBurner_GetCPU95thPercentile(t *testing.T) {
-	rb := createTestResourceBurner(t)
+	rb := createTestResourceBurner()
 
 	// Test with no samples
 	percentile := rb.getCPU95thPercentile()
@@ -584,7 +542,7 @@ func TestResourceBurner_GetCPU95thPercentile(t *testing.T) {
 }
 
 func TestResourceBurner_AdjustCPULoad(t *testing.T) {
-	rb := createTestResourceBurner(t)
+	rb := createTestResourceBurner()
 
 	// Test scaling up
 	rb.adjustCPULoad(80.0, 50.0) // target 80%, current 50%
@@ -601,8 +559,17 @@ func TestResourceBurner_AdjustCPULoad(t *testing.T) {
 	}
 }
 
+func TestResourceBurner_AdjustCPULoad_SmallPositiveDiff(t *testing.T) {
+	rb := createTestResourceBurner()
+
+	rb.adjustCPULoad(80.0, 69.0) // diff 11 should still scale up by at least one worker
+	if rb.cpuWorkers != 1 {
+		t.Errorf("Expected one CPU worker for small positive diff, got %d", rb.cpuWorkers)
+	}
+}
+
 func TestResourceBurner_AdjustMemoryLoad(t *testing.T) {
-	rb := createTestResourceBurner(t)
+	rb := createTestResourceBurner()
 
 	initialMemory := len(rb.memoryData)
 
@@ -622,7 +589,7 @@ func TestResourceBurner_AdjustMemoryLoad(t *testing.T) {
 }
 
 func TestResourceBurner_AdjustNetworkLoad(t *testing.T) {
-	rb := createTestResourceBurner(t)
+	rb := createTestResourceBurner()
 
 	// Test scaling up
 	rb.adjustNetworkLoad(30.0, 10.0) // target 30 Mbps, current 10 Mbps
@@ -636,6 +603,66 @@ func TestResourceBurner_AdjustNetworkLoad(t *testing.T) {
 	rb.adjustNetworkLoad(30.0, 40.0) // target 30 Mbps, current 40 Mbps
 	if rb.networkWorkers >= initialWorkers {
 		t.Errorf("Expected network workers to be scaled down from %d, got %d", initialWorkers, rb.networkWorkers)
+	}
+}
+
+func TestParseInterfaceTotalBytes(t *testing.T) {
+	procNetDev := `Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+  lo: 1234 0 0 0 0 0 0 0 1234 0 0 0 0 0 0 0
+eth0: 1000 0 0 0 0 0 0 0 2000 0 0 0 0 0 0 0
+eth0.100: 9999 0 0 0 0 0 0 0 9999 0 0 0 0 0 0 0
+`
+
+	totalBytes, err := parseInterfaceTotalBytes(procNetDev, "eth0")
+	if err != nil {
+		t.Fatalf("parseInterfaceTotalBytes() error = %v", err)
+	}
+
+	if totalBytes != 3000 {
+		t.Errorf("parseInterfaceTotalBytes() = %d, want 3000", totalBytes)
+	}
+}
+
+func TestParseInterfaceTotalBytes_NotFound(t *testing.T) {
+	procNetDev := `Inter-|   Receive | Transmit
+ face |bytes packets errs drop fifo frame compressed multicast|bytes packets errs drop fifo colls carrier compressed
+  lo: 10 0 0 0 0 0 0 0 20 0 0 0 0 0 0 0
+`
+
+	_, err := parseInterfaceTotalBytes(procNetDev, "eth0")
+	if err == nil {
+		t.Fatal("Expected error when interface is not present")
+	}
+}
+
+func TestCalculateNetworkUtilizationMbps(t *testing.T) {
+	deltaBytes := int64(125000) // 1 Mbps over one second
+	elapsed := time.Second
+
+	mbps := calculateNetworkUtilizationMbps(deltaBytes, elapsed)
+	if mbps != 1 {
+		t.Errorf("calculateNetworkUtilizationMbps() = %f, want 1", mbps)
+	}
+}
+
+func TestCalculateNetworkUtilizationMbps_InvalidInput(t *testing.T) {
+	tests := []struct {
+		name       string
+		deltaBytes int64
+		elapsed    time.Duration
+	}{
+		{name: "negative delta", deltaBytes: -1, elapsed: time.Second},
+		{name: "zero delta", deltaBytes: 0, elapsed: time.Second},
+		{name: "zero elapsed", deltaBytes: 125000, elapsed: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := calculateNetworkUtilizationMbps(tt.deltaBytes, tt.elapsed); got != 0 {
+				t.Errorf("calculateNetworkUtilizationMbps() = %f, want 0", got)
+			}
+		})
 	}
 }
 
@@ -658,7 +685,7 @@ func BenchmarkEncryptDecrypt(b *testing.B) {
 }
 
 func BenchmarkCPUPercentileCalculation(b *testing.B) {
-	rb := createTestResourceBurner(&testing.T{})
+	rb := createTestResourceBurner()
 
 	// Fill with sample data
 	for i := 0; i < 100; i++ {

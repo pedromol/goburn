@@ -1,9 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/aes"
+	crand "crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -60,6 +60,9 @@ type ResourceBurner struct {
 	// State tracking
 	lastScaleAction time.Time
 	scalingUp       bool
+	lastNetworkAt   time.Time
+	lastNetworkTxRx int64
+	networkRateMu   sync.Mutex
 
 	// CPU percentile tracking
 	cpuSamples     []float64
@@ -67,6 +70,12 @@ type ResourceBurner struct {
 }
 
 var l = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+const (
+	procNetDevPath          = "/proc/net/dev"
+	networkBurstPayloadSize = 64 * 1024
+	networkBurstPackets     = 4
+)
 
 func rnd(n int) string {
 	s := make([]rune, n)
@@ -97,7 +106,7 @@ func NewResourceBurner() (*ResourceBurner, error) {
 		return nil, fmt.Errorf("failed to load config: %v", err)
 	}
 
-	// Create in-cluster config
+	// Create in-cluster config.
 	k8sConfig, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create k8s config: %v", err)
@@ -228,7 +237,7 @@ func (rb *ResourceBurner) adjustCPULoad(targetUtilization, currentUtilization fl
 
 	if utilizationDiff > 10 && rb.cpuWorkers < maxWorkers {
 		// Scale up CPU workers
-		newWorkers := minInt(int(utilizationDiff/20), maxWorkers-rb.cpuWorkers)
+		newWorkers := minInt(int(math.Ceil(utilizationDiff/20)), maxWorkers-rb.cpuWorkers)
 		for i := 0; i < newWorkers; i++ {
 			stopChan := make(chan bool, 1)
 			rb.stopChannels = append(rb.stopChannels, stopChan)
@@ -263,7 +272,10 @@ func (rb *ResourceBurner) adjustMemoryLoad(targetUtilization, currentUtilization
 		// Scale up memory usage
 		currentSizeMB := int64(len(rb.memoryData) / 1024 / 1024)
 		additionalMB := int64(utilizationDiff * 10) // Rough estimation
-		newSizeMB := min(currentSizeMB+additionalMB, rb.config.MaxMemoryMB)
+		newSizeMB := currentSizeMB + additionalMB
+		if newSizeMB > rb.config.MaxMemoryMB {
+			newSizeMB = rb.config.MaxMemoryMB
+		}
 
 		if newSizeMB > currentSizeMB {
 			newData := make([]byte, newSizeMB*1024*1024)
@@ -283,7 +295,10 @@ func (rb *ResourceBurner) adjustMemoryLoad(targetUtilization, currentUtilization
 		// Scale down memory usage
 		currentSizeMB := int64(len(rb.memoryData) / 1024 / 1024)
 		reductionMB := int64(-utilizationDiff * 10) // Rough estimation
-		newSizeMB := max(0, currentSizeMB-reductionMB)
+		newSizeMB := currentSizeMB - reductionMB
+		if newSizeMB < 0 {
+			newSizeMB = 0
+		}
 
 		if newSizeMB < currentSizeMB {
 			if newSizeMB == 0 {
@@ -325,65 +340,168 @@ func (rb *ResourceBurner) networkWorker(stopChan chan bool) {
 }
 
 func (rb *ResourceBurner) generateNetworkTraffic() {
-	// Create a local connection to generate network stats
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	localIP, broadcastIP, err := getInterfaceIPv4AndBroadcast(rb.config.NetworkInterface)
 	if err != nil {
 		return
 	}
-	defer listener.Close()
 
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-
-		// Read and discard data
-		buffer := make([]byte, 1024)
-		conn.Read(buffer)
-	}()
-
-	// Connect and send data
-	conn, err := net.Dial("tcp", listener.Addr().String())
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: localIP, Port: 0})
 	if err != nil {
 		return
 	}
 	defer conn.Close()
 
-	// Send random data to generate network utilization
-	data := make([]byte, 1024*10) // 10KB
-	rand.Read(data)
-	conn.Write(data)
+	if err := enableUDPBroadcast(conn); err != nil {
+		return
+	}
+
+	_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+
+	destination := &net.UDPAddr{IP: broadcastIP, Port: 9}
+	payload := make([]byte, networkBurstPayloadSize)
+	if _, err := crand.Read(payload); err != nil {
+		return
+	}
+
+	for i := 0; i < networkBurstPackets; i++ {
+		if _, err := conn.WriteToUDP(payload, destination); err != nil {
+			return
+		}
+	}
 }
 
 func (rb *ResourceBurner) getNetworkUtilization() (float64, error) {
-	file, err := os.Open("/proc/net/dev")
+	totalBytes, err := readInterfaceTotalBytes(rb.config.NetworkInterface)
 	if err != nil {
-		return 0, fmt.Errorf("failed to open /proc/net/dev: %v", err)
+		return 0, err
 	}
-	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-	var totalBytes int64
+	now := time.Now()
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.Contains(line, rb.config.NetworkInterface) {
-			fields := strings.Fields(line)
-			if len(fields) >= 10 {
-				rxBytes, _ := strconv.ParseInt(fields[1], 10, 64)
-				txBytes, _ := strconv.ParseInt(fields[9], 10, 64)
-				totalBytes = rxBytes + txBytes
-			}
-			break
+	rb.networkRateMu.Lock()
+	defer rb.networkRateMu.Unlock()
+
+	if rb.lastNetworkAt.IsZero() {
+		rb.lastNetworkAt = now
+		rb.lastNetworkTxRx = totalBytes
+		return 0, nil
+	}
+
+	elapsed := now.Sub(rb.lastNetworkAt)
+	deltaBytes := totalBytes - rb.lastNetworkTxRx
+
+	rb.lastNetworkAt = now
+	rb.lastNetworkTxRx = totalBytes
+
+	return calculateNetworkUtilizationMbps(deltaBytes, elapsed), nil
+}
+
+func readInterfaceTotalBytes(interfaceName string) (int64, error) {
+	data, err := os.ReadFile(procNetDevPath)
+	if err != nil {
+		return 0, fmt.Errorf("failed to read %s: %v", procNetDevPath, err)
+	}
+
+	return parseInterfaceTotalBytes(string(data), interfaceName)
+}
+
+func parseInterfaceTotalBytes(procNetDev, interfaceName string) (int64, error) {
+	for _, rawLine := range strings.Split(procNetDev, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || !strings.Contains(line, ":") {
+			continue
 		}
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		iface := strings.TrimSpace(parts[0])
+		if iface != interfaceName {
+			continue
+		}
+
+		fields := strings.Fields(parts[1])
+		if len(fields) < 9 {
+			return 0, fmt.Errorf("unexpected format for interface %q in %s", interfaceName, procNetDevPath)
+		}
+
+		rxBytes, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse rx bytes for interface %q: %v", interfaceName, err)
+		}
+
+		txBytes, err := strconv.ParseInt(fields[8], 10, 64)
+		if err != nil {
+			return 0, fmt.Errorf("failed to parse tx bytes for interface %q: %v", interfaceName, err)
+		}
+
+		return rxBytes + txBytes, nil
 	}
 
-	// Convert to Mbps (rough estimation)
-	// This is a simplified calculation - in production you'd want to track over time
-	mbps := float64(totalBytes) / (1024 * 1024) / 60 // Rough estimate per minute
-	return mbps, nil
+	return 0, fmt.Errorf("network interface %q not found in %s", interfaceName, procNetDevPath)
+}
+
+func calculateNetworkUtilizationMbps(deltaBytes int64, elapsed time.Duration) float64 {
+	if deltaBytes <= 0 || elapsed <= 0 {
+		return 0
+	}
+
+	return (float64(deltaBytes) * 8) / elapsed.Seconds() / 1_000_000
+}
+
+func getInterfaceIPv4AndBroadcast(interfaceName string) (net.IP, net.IP, error) {
+	iface, err := net.InterfaceByName(interfaceName)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get network interface %q: %v", interfaceName, err)
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to list addresses for interface %q: %v", interfaceName, err)
+	}
+
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+
+		ip4 := ipNet.IP.To4()
+		if ip4 == nil || ip4.IsLoopback() {
+			continue
+		}
+
+		if len(ipNet.Mask) != net.IPv4len {
+			continue
+		}
+
+		broadcast := make(net.IP, net.IPv4len)
+		for i := 0; i < net.IPv4len; i++ {
+			broadcast[i] = ip4[i] | ^ipNet.Mask[i]
+		}
+
+		return ip4, broadcast, nil
+	}
+
+	return nil, nil, fmt.Errorf("interface %q does not have a usable IPv4 address", interfaceName)
+}
+
+func enableUDPBroadcast(conn *net.UDPConn) error {
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	var controlErr error
+	if err := rawConn.Control(func(fd uintptr) {
+		controlErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1)
+	}); err != nil {
+		return err
+	}
+
+	return controlErr
 }
 
 // CPU percentile tracking functions
@@ -492,7 +610,11 @@ func (rb *ResourceBurner) monitor(ctx context.Context) {
 			cpu95th := rb.getCPU95thPercentile()
 
 			// Get network utilization
-			networkUtil, _ := rb.getNetworkUtilization()
+			networkUtil, err := rb.getNetworkUtilization()
+			if err != nil {
+				log.Printf("Failed to get network utilization: %v", err)
+				networkUtil = 0
+			}
 
 			log.Printf("Current utilization - CPU: %.1f%% (95th: %.1f%%), Memory: %.1f%%, Network: %.1f Mbps, Workers: %d/%d, Memory: %d MB",
 				cpuUtil, cpu95th, memUtil, networkUtil, rb.cpuWorkers, rb.networkWorkers, len(rb.memoryData)/1024/1024)
@@ -583,22 +705,8 @@ func (rb *ResourceBurner) Run(ctx context.Context) error {
 	return nil
 }
 
-func min(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 func minInt(a, b int) int {
 	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int64) int64 {
-	if a > b {
 		return a
 	}
 	return b

@@ -1,5 +1,8 @@
 version: "3.4"
 
+# Standalone Docker Compose is kept only as a configuration example.
+# goburn requires Kubernetes in-cluster credentials and metrics-server to run.
+
 services:
   goburn:
     container_name: goburn
@@ -17,7 +20,5 @@ services:
       - NODE_NAME=docker-host
       - ENABLE_MEMORY_UTILIZATION=true
       - NETWORK_INTERFACE=eth0
-    cpus: 2.0
-    memory: 2g
-    restart: unless-stopped
-    # Note: For Kubernetes deployment, use k8s-manifests.yaml instead
+    restart: "no"
+    # Note: For runtime validation, deploy with k8s-manifests.yaml instead.

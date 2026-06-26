@@ -143,12 +143,20 @@ kubectl logs -l app=goburn,arch=amd64 -f
 kubectl logs -l app=goburn,arch=arm64 -f
 ```
 
-### Docker Compose (Testing)
+### Local Validation
 
-For local testing or single-node scenarios:
+Standalone `docker-compose` execution is not supported for runtime validation because
+`goburn` requires Kubernetes in-cluster credentials and access to the metrics API.
+
+Use these options locally instead:
 
 ```bash
-docker-compose up -d
+# Static and unit validation
+go test ./...
+go vet ./...
+
+# Runtime validation
+kubectl apply -f k8s-manifests.yaml
 ```
 
 ## 📈 Monitoring
@@ -196,6 +204,7 @@ Deploy across multiple clusters with different configurations:
 **Metrics not available**:
 - Ensure metrics-server is installed in your cluster
 - Check RBAC permissions for the goburn service account
+- Remember that the binary must run inside Kubernetes; local standalone containers do not have in-cluster credentials
 
 **Resource not scaling**:
 - Verify target utilization settings
