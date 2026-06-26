@@ -77,10 +77,14 @@ graph TD
 | `MONITOR_INTERVAL_SECONDS` | 30 | How often to check and adjust resources |
 | `SCALE_UP_DELAY_SECONDS` | 60 | Minimum time between scale-up actions |
 | `SCALE_DOWN_DELAY_SECONDS` | 120 | Minimum time between scale-down actions |
+| `NETWORK_WORKER_INTERVAL_MS` | 100 | Delay between network traffic bursts per worker |
+| `NETWORK_BURST_BYTES` | 65536 | Total bytes each worker tries to send per burst |
 | `MAX_MEMORY_MB` | 2048 | Maximum memory to allocate (safety limit) |
 | `ENABLE_MEMORY_UTILIZATION` | true | Enable memory utilization on this node |
 | `NETWORK_INTERFACE` | eth0 | Network interface to monitor/generate traffic |
-| `NODE_NAME` | auto-detected | Kubernetes node name to monitor |
+| `NODE_NAME` | required | Kubernetes node name from the Downward API (`spec.nodeName`) |
+
+For the current `molinstance2` ARM64 node, the deploy manifests use `NETWORK_INTERFACE=enp0s6` so a redeploy does not revert the live fix.
 
 ### Example Configurations
 

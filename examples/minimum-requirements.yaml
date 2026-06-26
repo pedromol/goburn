@@ -63,7 +63,11 @@ spec:
         - name: ENABLE_MEMORY_UTILIZATION
           value: "true"      # Set to "false" to disable memory enforcement on specific nodes
         - name: NETWORK_INTERFACE
-          value: "eth0"      # Network interface to monitor/generate traffic
+          value: "enp0s6"    # Network interface to monitor/generate traffic
+        - name: NETWORK_WORKER_INTERVAL_MS
+          value: "100"       # Delay between traffic bursts per worker
+        - name: NETWORK_BURST_BYTES
+          value: "65536"     # Bytes each worker sends per burst
         
         resources:
           requests:

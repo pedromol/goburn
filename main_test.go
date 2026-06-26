@@ -16,8 +16,10 @@ func TestLoadConfig(t *testing.T) {
 		expected Config
 	}{
 		{
-			name:    "default config",
-			envVars: map[string]string{},
+			name: "default config",
+			envVars: map[string]string{
+				"NODE_NAME": "test-node",
+			},
 			expected: Config{
 				TargetCPUUtilization:      80.0,
 				TargetMemoryUtilization:   80.0,
@@ -27,9 +29,12 @@ func TestLoadConfig(t *testing.T) {
 				MonitorInterval:           30 * time.Second,
 				ScaleUpDelay:              60 * time.Second,
 				ScaleDownDelay:            120 * time.Second,
+				NetworkWorkerInterval:     100 * time.Millisecond,
 				MaxMemoryMB:               1024,
+				NetworkBurstBytes:         defaultNetworkBurstBytes,
 				EnableMemoryUtilization:   true,
 				NetworkInterface:          "eth0",
+				NodeName:                  "test-node",
 			},
 		},
 		{
@@ -43,6 +48,8 @@ func TestLoadConfig(t *testing.T) {
 				"MONITOR_INTERVAL_SECONDS":     "60",
 				"SCALE_UP_DELAY_SECONDS":       "120",
 				"SCALE_DOWN_DELAY_SECONDS":     "180",
+				"NETWORK_WORKER_INTERVAL_MS":   "250",
+				"NETWORK_BURST_BYTES":          "32768",
 				"MAX_MEMORY_MB":                "2048",
 				"ENABLE_MEMORY_UTILIZATION":    "false",
 				"NETWORK_INTERFACE":            "ens0",
@@ -57,7 +64,9 @@ func TestLoadConfig(t *testing.T) {
 				MonitorInterval:           60 * time.Second,
 				ScaleUpDelay:              120 * time.Second,
 				ScaleDownDelay:            180 * time.Second,
+				NetworkWorkerInterval:     250 * time.Millisecond,
 				MaxMemoryMB:               2048,
+				NetworkBurstBytes:         32768,
 				EnableMemoryUtilization:   false,
 				NetworkInterface:          "ens0",
 				NodeName:                  "test-node",
@@ -102,8 +111,14 @@ func TestLoadConfig(t *testing.T) {
 			if config.ScaleDownDelay != tt.expected.ScaleDownDelay {
 				t.Errorf("ScaleDownDelay = %v, want %v", config.ScaleDownDelay, tt.expected.ScaleDownDelay)
 			}
+			if config.NetworkWorkerInterval != tt.expected.NetworkWorkerInterval {
+				t.Errorf("NetworkWorkerInterval = %v, want %v", config.NetworkWorkerInterval, tt.expected.NetworkWorkerInterval)
+			}
 			if config.MaxMemoryMB != tt.expected.MaxMemoryMB {
 				t.Errorf("MaxMemoryMB = %v, want %v", config.MaxMemoryMB, tt.expected.MaxMemoryMB)
+			}
+			if config.NetworkBurstBytes != tt.expected.NetworkBurstBytes {
+				t.Errorf("NetworkBurstBytes = %v, want %v", config.NetworkBurstBytes, tt.expected.NetworkBurstBytes)
 			}
 			if config.EnableMemoryUtilization != tt.expected.EnableMemoryUtilization {
 				t.Errorf("EnableMemoryUtilization = %v, want %v", config.EnableMemoryUtilization, tt.expected.EnableMemoryUtilization)
@@ -120,6 +135,13 @@ func TestLoadConfig(t *testing.T) {
 				os.Unsetenv(key)
 			}
 		})
+	}
+}
+
+func TestLoadConfigRequiresNodeName(t *testing.T) {
+	_, err := loadConfig()
+	if err == nil {
+		t.Fatal("Expected loadConfig() to require NODE_NAME")
 	}
 }
 
@@ -464,7 +486,9 @@ func createTestResourceBurner() *ResourceBurner {
 		MonitorInterval:           30 * time.Second,
 		ScaleUpDelay:              60 * time.Second,
 		ScaleDownDelay:            120 * time.Second,
+		NetworkWorkerInterval:     100 * time.Millisecond,
 		MaxMemoryMB:               1024,
+		NetworkBurstBytes:         defaultNetworkBurstBytes,
 		NodeName:                  "test-node",
 		EnableMemoryUtilization:   true,
 		NetworkInterface:          "eth0",
@@ -663,6 +687,58 @@ func TestCalculateNetworkUtilizationMbps_InvalidInput(t *testing.T) {
 				t.Errorf("calculateNetworkUtilizationMbps() = %f, want 0", got)
 			}
 		})
+	}
+}
+
+func TestCalculateNetworkBurstProfile(t *testing.T) {
+	tests := []struct {
+		name              string
+		mtu               int
+		expectedPayload   int
+		expectedMinPacket int
+	}{
+		{
+			name:              "standard ethernet mtu",
+			mtu:               1500,
+			expectedPayload:   1472,
+			expectedMinPacket: 45,
+		},
+		{
+			name:              "jumbo frame mtu",
+			mtu:               9000,
+			expectedPayload:   8972,
+			expectedMinPacket: 8,
+		},
+		{
+			name:              "fallback payload for tiny mtu",
+			mtu:               0,
+			expectedPayload:   defaultNetworkBurstPayloadSize,
+			expectedMinPacket: 47,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			payloadSize, packetCount := calculateNetworkBurstProfile(tt.mtu, defaultNetworkBurstBytes)
+			if payloadSize != tt.expectedPayload {
+				t.Fatalf("calculateNetworkBurstProfile() payload = %d, want %d", payloadSize, tt.expectedPayload)
+			}
+
+			if packetCount != tt.expectedMinPacket {
+				t.Fatalf("calculateNetworkBurstProfile() packetCount = %d, want %d", packetCount, tt.expectedMinPacket)
+			}
+		})
+	}
+}
+
+func TestCalculateNetworkBurstProfile_CustomDesiredBytes(t *testing.T) {
+	payloadSize, packetCount := calculateNetworkBurstProfile(1500, 3000)
+	if payloadSize != 1472 {
+		t.Fatalf("calculateNetworkBurstProfile() payload = %d, want 1472", payloadSize)
+	}
+
+	if packetCount != 3 {
+		t.Fatalf("calculateNetworkBurstProfile() packetCount = %d, want 3", packetCount)
 	}
 }
 

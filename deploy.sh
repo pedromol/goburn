@@ -120,6 +120,10 @@ spec:
           value: "2048"
         - name: NETWORK_INTERFACE
           value: "eth0"
+        - name: NETWORK_WORKER_INTERVAL_MS
+          value: "100"
+        - name: NETWORK_BURST_BYTES
+          value: "65536"
         resources:
           requests:
             memory: "100Mi"
@@ -201,7 +205,11 @@ spec:
         - name: MAX_MEMORY_MB
           value: "2048"
         - name: NETWORK_INTERFACE
-          value: "eth0"
+          value: "enp0s6"
+        - name: NETWORK_WORKER_INTERVAL_MS
+          value: "100"
+        - name: NETWORK_BURST_BYTES
+          value: "65536"
         resources:
           requests:
             memory: "100Mi"

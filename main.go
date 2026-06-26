@@ -36,7 +36,9 @@ type Config struct {
 	MonitorInterval           time.Duration
 	ScaleUpDelay              time.Duration
 	ScaleDownDelay            time.Duration
+	NetworkWorkerInterval     time.Duration
 	MaxMemoryMB               int64
+	NetworkBurstBytes         int
 	NodeName                  string
 	EnableMemoryUtilization   bool
 	NetworkInterface          string
@@ -63,6 +65,9 @@ type ResourceBurner struct {
 	lastNetworkAt   time.Time
 	lastNetworkTxRx int64
 	networkRateMu   sync.Mutex
+	networkErrorMu  sync.Mutex
+	lastNetworkErr  string
+	lastNetworkLog  time.Time
 
 	// CPU percentile tracking
 	cpuSamples     []float64
@@ -72,9 +77,12 @@ type ResourceBurner struct {
 var l = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 
 const (
-	procNetDevPath          = "/proc/net/dev"
-	networkBurstPayloadSize = 64 * 1024
-	networkBurstPackets     = 4
+	procNetDevPath                 = "/proc/net/dev"
+	defaultNetworkBurstPayloadSize = 1400
+	defaultNetworkBurstBytes       = 64 * 1024
+	maxUDPIPv4PayloadSize          = 65507
+	udpIPv4HeaderSize              = 28
+	networkErrorLogInterval        = 30 * time.Second
 )
 
 func rnd(n int) string {
@@ -145,18 +153,24 @@ func loadConfig() (Config, error) {
 		MonitorInterval:           time.Duration(getEnvInt("MONITOR_INTERVAL_SECONDS", 30)) * time.Second,
 		ScaleUpDelay:              time.Duration(getEnvInt("SCALE_UP_DELAY_SECONDS", 60)) * time.Second,
 		ScaleDownDelay:            time.Duration(getEnvInt("SCALE_DOWN_DELAY_SECONDS", 120)) * time.Second,
+		NetworkWorkerInterval:     time.Duration(getEnvInt("NETWORK_WORKER_INTERVAL_MS", 100)) * time.Millisecond,
 		MaxMemoryMB:               int64(getEnvInt("MAX_MEMORY_MB", 1024)),
+		NetworkBurstBytes:         getEnvInt("NETWORK_BURST_BYTES", defaultNetworkBurstBytes),
 		NodeName:                  os.Getenv("NODE_NAME"),
 		EnableMemoryUtilization:   getEnvBool("ENABLE_MEMORY_UTILIZATION", true),
 		NetworkInterface:          getEnvString("NETWORK_INTERFACE", "eth0"),
 	}
 
 	if config.NodeName == "" {
-		hostname, err := os.Hostname()
-		if err != nil {
-			return config, fmt.Errorf("failed to get hostname and NODE_NAME not set: %v", err)
-		}
-		config.NodeName = hostname
+		return config, fmt.Errorf("NODE_NAME must be set via the Kubernetes Downward API (spec.nodeName)")
+	}
+
+	if config.NetworkWorkerInterval <= 0 {
+		return config, fmt.Errorf("NETWORK_WORKER_INTERVAL_MS must be greater than zero")
+	}
+
+	if config.NetworkBurstBytes <= 0 {
+		return config, fmt.Errorf("NETWORK_BURST_BYTES must be greater than zero")
 	}
 
 	return config, nil
@@ -333,41 +347,48 @@ func (rb *ResourceBurner) networkWorker(stopChan chan bool) {
 			return
 		default:
 			// Generate network traffic by creating connections and sending data
-			rb.generateNetworkTraffic()
-			time.Sleep(100 * time.Millisecond)
+			if err := rb.generateNetworkTraffic(); err != nil {
+				rb.logNetworkError(err)
+			}
+			time.Sleep(rb.config.NetworkWorkerInterval)
 		}
 	}
 }
 
-func (rb *ResourceBurner) generateNetworkTraffic() {
-	localIP, broadcastIP, err := getInterfaceIPv4AndBroadcast(rb.config.NetworkInterface)
+func (rb *ResourceBurner) generateNetworkTraffic() error {
+	localIP, broadcastIP, mtu, err := getInterfaceIPv4AndBroadcastAndMTU(rb.config.NetworkInterface)
 	if err != nil {
-		return
+		return err
 	}
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: localIP, Port: 0})
 	if err != nil {
-		return
+		return fmt.Errorf("failed to listen for network traffic generation: %v", err)
 	}
 	defer conn.Close()
 
 	if err := enableUDPBroadcast(conn); err != nil {
-		return
+		return fmt.Errorf("failed to enable UDP broadcast: %v", err)
 	}
 
-	_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+	if err := conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		return fmt.Errorf("failed to set UDP write deadline: %v", err)
+	}
 
 	destination := &net.UDPAddr{IP: broadcastIP, Port: 9}
-	payload := make([]byte, networkBurstPayloadSize)
+	payloadSize, packetCount := calculateNetworkBurstProfile(mtu, rb.config.NetworkBurstBytes)
+	payload := make([]byte, payloadSize)
 	if _, err := crand.Read(payload); err != nil {
-		return
+		return fmt.Errorf("failed to populate network payload: %v", err)
 	}
 
-	for i := 0; i < networkBurstPackets; i++ {
+	for i := 0; i < packetCount; i++ {
 		if _, err := conn.WriteToUDP(payload, destination); err != nil {
-			return
+			return fmt.Errorf("failed to send UDP broadcast to %s on %s: %v", destination.IP.String(), rb.config.NetworkInterface, err)
 		}
 	}
+
+	return nil
 }
 
 func (rb *ResourceBurner) getNetworkUtilization() (float64, error) {
@@ -451,15 +472,53 @@ func calculateNetworkUtilizationMbps(deltaBytes int64, elapsed time.Duration) fl
 	return (float64(deltaBytes) * 8) / elapsed.Seconds() / 1_000_000
 }
 
-func getInterfaceIPv4AndBroadcast(interfaceName string) (net.IP, net.IP, error) {
+func calculateNetworkBurstProfile(mtu int, desiredBytes int) (payloadSize int, packetCount int) {
+	payloadSize = defaultNetworkBurstPayloadSize
+	if mtu > udpIPv4HeaderSize {
+		payloadSize = mtu - udpIPv4HeaderSize
+	}
+
+	if payloadSize > maxUDPIPv4PayloadSize {
+		payloadSize = maxUDPIPv4PayloadSize
+	}
+
+	packetCount = int(math.Ceil(float64(desiredBytes) / float64(payloadSize)))
+	if packetCount < 1 {
+		packetCount = 1
+	}
+
+	return payloadSize, packetCount
+}
+
+func (rb *ResourceBurner) logNetworkError(err error) {
+	if err == nil {
+		return
+	}
+
+	msg := err.Error()
+	now := time.Now()
+
+	rb.networkErrorMu.Lock()
+	defer rb.networkErrorMu.Unlock()
+
+	if msg == rb.lastNetworkErr && now.Sub(rb.lastNetworkLog) < networkErrorLogInterval {
+		return
+	}
+
+	rb.lastNetworkErr = msg
+	rb.lastNetworkLog = now
+	log.Printf("Failed to generate network traffic on %s: %v", rb.config.NetworkInterface, err)
+}
+
+func getInterfaceIPv4AndBroadcastAndMTU(interfaceName string) (net.IP, net.IP, int, error) {
 	iface, err := net.InterfaceByName(interfaceName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get network interface %q: %v", interfaceName, err)
+		return nil, nil, 0, fmt.Errorf("failed to get network interface %q: %v", interfaceName, err)
 	}
 
 	addrs, err := iface.Addrs()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to list addresses for interface %q: %v", interfaceName, err)
+		return nil, nil, 0, fmt.Errorf("failed to list addresses for interface %q: %v", interfaceName, err)
 	}
 
 	for _, addr := range addrs {
@@ -482,10 +541,10 @@ func getInterfaceIPv4AndBroadcast(interfaceName string) (net.IP, net.IP, error) 
 			broadcast[i] = ip4[i] | ^ipNet.Mask[i]
 		}
 
-		return ip4, broadcast, nil
+		return ip4, broadcast, iface.MTU, nil
 	}
 
-	return nil, nil, fmt.Errorf("interface %q does not have a usable IPv4 address", interfaceName)
+	return nil, nil, 0, fmt.Errorf("interface %q does not have a usable IPv4 address", interfaceName)
 }
 
 func enableUDPBroadcast(conn *net.UDPConn) error {
